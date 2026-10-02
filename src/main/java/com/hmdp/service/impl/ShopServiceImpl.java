@@ -45,38 +45,60 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
     public Shop queryWithMutex(Long id) {
         String key = CACHE_SHOP_KEY + id;
+        // 1. 从redis查询商铺缓存
         String shopJson = stringRedisTemplate.opsForValue().get(key);
+        // 2. 判断是否存在
         if (StrUtil.isNotBlank(shopJson)) {
-            // 反序列化
-            Shop shop = JSONUtil.toBean(shopJson, Shop.class);
-            return shop;
+            // 3. 存在，直接返回
+            return JSONUtil.toBean(shopJson, Shop.class);
         }
+        // 4. 判断命中的是否是空值
         if (shopJson != null) {
-            // 缓存空值
             return null;
         }
-        // 实现缓存重建
-        String lockKey = null;
+        // 5. 实现缓存重建
         Shop shop = null;
+        String lockKey = RedisConstants.LOCK_SHOP_KEY + id;
         try {
-            lockKey = RedisConstants.LOCK_SHOP_KEY + id;
-            if (!tryLock(lockKey)) {
-                // 等待并重试
+            // 循环获取锁，避免递归调用导致栈溢出
+            int retryCount = 0;
+            int maxRetry = 50; // 最大重试次数：50 * 50ms = 2.5s
+            while (!tryLock(lockKey)) {
+                if (++retryCount > maxRetry) {
+                    throw new RuntimeException("系统繁忙，请稍后重试");
+                }
                 Thread.sleep(50);
-                return queryWithMutex(id);
+                // 等待期间其他线程可能已重建缓存，再次查询避免无效等待
+                shopJson = stringRedisTemplate.opsForValue().get(key);
+                if (StrUtil.isNotBlank(shopJson)) {
+                    return JSONUtil.toBean(shopJson, Shop.class);
+                }
+                if (shopJson != null) {
+                    return null;
+                }
             }
+            // 6. 获取锁成功后做双重检查（Double-Check）
+            shopJson = stringRedisTemplate.opsForValue().get(key);
+            if (StrUtil.isNotBlank(shopJson)) {
+                return JSONUtil.toBean(shopJson, Shop.class);
+            }
+            // 7. 根据id查询数据库
             shop = getById(id);
             Thread.sleep(200); // 模拟重建延时
+            // 8. 不存在，返回错误
             if (shop == null) {
-                // 缓存空值
+                // 将空值写入redis
                 stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
                 return null;
             }
-            // 序列化
+            // 9. 存在，写入redis
             stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
         } catch (InterruptedException e) {
-            throw new RuntimeException(e);
+            // 恢复中断状态
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("线程被中断", e);
         } finally {
+            // 释放锁
             unlock(lockKey);
         }
         return shop;
